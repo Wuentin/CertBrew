@@ -52,13 +52,43 @@ void LogMessage(const wchar_t* format, ...) {
     va_end(args);
 }
 
+struct ComException : public std::runtime_error {
+    HRESULT hr;
+    ComException(HRESULT code, const std::string& msg)
+        : std::runtime_error(msg), hr(code) {}
+};
+
 inline void ThrowIfFailed(HRESULT hr, const char* msg) {
     if (FAILED(hr)) {
+        char* sysMsg = nullptr;
+        FormatMessageA(
+            FORMAT_MESSAGE_ALLOCATE_BUFFER
+            | FORMAT_MESSAGE_FROM_SYSTEM
+            | FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL, hr,
+            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            (LPSTR)&sysMsg, 0, NULL
+        );
+
+        std::string errorDesc = "Unknown Error";
+        if (sysMsg) {
+            errorDesc = sysMsg;
+            while (!errorDesc.empty() &&
+                (errorDesc.back() == '\r' || errorDesc.back() == '\n')) {
+                errorDesc.pop_back();
+            }
+            LocalFree(sysMsg);
+        }
+
         std::ostringstream oss;
-        oss << msg << " failed with error: 0x" << std::hex << hr;
-        throw std::runtime_error(oss.str());
+        oss << "\n[!] CertBrew error: " << msg
+            << " - Reason: " << errorDesc
+            << " (Code: 0x" << std::hex << hr << ")";
+
+        throw ComException(hr, oss.str());
     }
 }
+
 
 std::wstring GetUPN() {
     DWORD len = 0;
@@ -456,7 +486,7 @@ BOOL StealAndEnroll(DWORD pid, wchar_t* tmpl, wchar_t* ca, wchar_t* pass) {
         }
 
         if (!p) {
-            LogMessage(L"[-] OpenProcess failed completely (err=%lu)\n", GetLastError());
+            LogMessage(L"[-] OpenProcess could not open the process (err=%lu - incorrect PID or insufficient access)\n", GetLastError());
             return FALSE;
         }
     }
