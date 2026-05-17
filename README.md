@@ -14,7 +14,7 @@
 
 Usage:
   C:\Users\cersei.lannister\Desktop\CertBrew.exe /list
-  C:\Users\cersei.lannister\Desktop\CertBrew.exe /steal /pid:<PID> /template:<Template> /ca:<CA> /pass:<password> [/outfile:file]
+  C:\Users\cersei.lannister\Desktop\CertBrew.exe /steal /pid:<PID> /template:<Template> [/ca:<CA>] /pass:<password> [/outfile:file]
 ```
 
 ## Purpose
@@ -97,6 +97,10 @@ MS-CA" /pass:Fromage  /outfile:user.pfx
 [*] Exporting PFX from memory store...
 [+] SUCCESS. Binary PFX saved to: user.pfx
 ```
+
+#### Certification Autority Definition
+The CA option need a specific format : ComputerName\CAName, where ComputerName is the network name of the server, and CAName is the common name of the certification authority. 
+If omitted, CertBrew will attempt to auto-resolve the CA by enumerating Active Directory Enrollment Services via the ICertConfig COM interface. If exactly one CA is found, it is selected automatically. If multiple CAs are published, the tool will list them and exit, requiring the user to specify one explicitly.
 
 ### Post Exploitation
 Once issued, the certificate may enable full user impersonation through certificate-based authentication (e.g., PKINIT), assuming the targeted account is configured to allow smart-card or certificate logon.
